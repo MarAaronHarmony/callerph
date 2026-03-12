@@ -23,15 +23,15 @@ except ImportError:
 
 # --- Configuration ---
 # How many consecutive speech/silence frames to require before state change
-SPEECH_START_FRAMES = 3  # ~60ms of speech to start
-SPEECH_END_FRAMES = 15  # ~300ms of silence to end (at 20ms per frame)
-SILENCE_TIMEOUT = 0.5  # seconds of confirmed silence before activity_end
+SPEECH_START_FRAMES = 2  # ~40ms of speech to start (fast detection)
+SPEECH_END_FRAMES = 12  # ~240ms of silence to end (at 20ms per frame)
+SILENCE_TIMEOUT = 0.4  # seconds of confirmed silence before activity_end
 
 
 class VoiceActivityDetector:
     """Detects speech in PCM audio using WebRTC VAD or energy fallback."""
 
-    def __init__(self, sample_rate: int = 16000, aggressiveness: int = 2):
+    def __init__(self, sample_rate: int = 16000, aggressiveness: int = 1):
         """Initialize VAD.
 
         Args:
@@ -39,7 +39,7 @@ class VoiceActivityDetector:
             aggressiveness: WebRTC VAD aggressiveness (0-3).
                 0 = least aggressive (fewer false negatives, more false positives)
                 3 = most aggressive (more false negatives, fewer false positives)
-                2 = good balance for phone calls
+                1 = good for telephone audio (mulaw-converted, lower quality)
         """
         self.sample_rate = sample_rate
         self.is_speaking = False
@@ -51,9 +51,9 @@ class VoiceActivityDetector:
             self._vad = webrtcvad.Vad(aggressiveness)
         else:
             self._vad = None
-            # Fallback thresholds
-            self._energy_threshold = 350
-            self._zcr_speech_max = 0.3  # speech has moderate zero-crossing rate
+            # Fallback thresholds — lower for telephone-quality audio
+            self._energy_threshold = 250
+            self._zcr_speech_max = 0.5  # wider range for mulaw-converted audio
 
     def process_frame(self, pcm_audio: bytes) -> str:
         """Process an audio frame and return the VAD event.
@@ -131,8 +131,8 @@ class VoiceActivityDetector:
 
         if total_frames == 0:
             return False
-        # Speech if more than 30% of frames have speech
-        return speech_frames / total_frames > 0.3
+        # Speech if ANY frame has speech (lenient for telephone audio)
+        return speech_frames > 0
 
     def _detect_energy(self, pcm_audio: bytes) -> bool:
         """Fallback: energy + zero-crossing rate analysis."""

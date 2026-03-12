@@ -218,6 +218,14 @@ class GeminiVoiceAgent:
         # VAD processing
         event = self._vad.process_frame(pcm_audio)
 
+        # Log VAD state periodically for diagnostics
+        self._vad_frame_count = getattr(self, "_vad_frame_count", 0) + 1
+        if self._vad_frame_count % 100 == 1:
+            logger.info(
+                f"VAD frame #{self._vad_frame_count}: event={event}, "
+                f"speaking={self._vad.is_speaking}"
+            )
+
         try:
             if event == "speech_start":
                 # Flush any buffered audio and signal activity start
