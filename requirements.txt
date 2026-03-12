@@ -1,0 +1,19 @@
+# Core
+fastapi
+uvicorn[standard]
+twilio
+google-genai
+websockets
+sqlmodel
+python-dotenv
+pydantic
+pydantic-settings
+python-multipart
+audioop-lts
+
+# Dev
+pytest
+pytest-asyncio
+httpx
+pytest-cov
+ruff

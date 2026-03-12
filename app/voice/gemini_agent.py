@@ -1,0 +1,398 @@
+"""Gemini 2.5 Flash Live API voice agent with manual VAD."""
+
+import asyncio
+import logging
+import struct
+from typing import Callable, Optional
+
+from google import genai
+from google.genai import types
+from sqlmodel import Session
+
+from app.config import settings
+from app.db.database import get_engine
+from app.models.call_log import CallLog
+
+logger = logging.getLogger(__name__)
+
+# Speech detection thresholds
+_SPEECH_START_RMS = 400    # RMS above this = potential speech (raised to filter coughs)
+_SPEECH_END_RMS = 150      # RMS below this = speech may have ended
+_SILENCE_DURATION = 0.4    # seconds of silence before ending activity
+_SPEECH_START_CHUNKS = 3   # consecutive loud chunks needed to confirm speech (debounce)
+
+# Tool declaration for real-time lead capture
+_SAVE_LEAD_TOOL = {
+    "function_declarations": [
+        {
+            "name": "save_lead",
+            "description": (
+                "Save caller's lead information to the database. "
+                "Call this function as soon as the caller provides their name, "
+                "contact number, or describes their inquiry. "
+                "You can call this multiple times as you gather more details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "caller_name": {
+                        "type": "string",
+                        "description": "The caller's full name",
+                    },
+                    "contact_number": {
+                        "type": "string",
+                        "description": "The caller's phone number or email for follow-up",
+                    },
+                    "inquiry": {
+                        "type": "string",
+                        "description": "What the caller is asking about or interested in",
+                    },
+                },
+                "required": [],
+            },
+        }
+    ]
+}
+
+
+def _rms_energy(pcm_audio: bytes) -> float:
+    """Calculate RMS energy of 16-bit PCM audio."""
+    if len(pcm_audio) < 2:
+        return 0.0
+    n_samples = len(pcm_audio) // 2
+    samples = struct.unpack(f"<{n_samples}h", pcm_audio[: n_samples * 2])
+    sum_sq = sum(s * s for s in samples)
+    return (sum_sq / n_samples) ** 0.5
+
+
+class GeminiVoiceAgent:
+    """Manages a real-time voice conversation with Gemini Live API."""
+
+    def __init__(
+        self,
+        system_prompt: str,
+        call_sid: str,
+        on_audio_response: Optional[Callable] = None,
+    ):
+        self.system_prompt = system_prompt
+        self.call_sid = call_sid
+        self.on_audio_response = on_audio_response
+        self.session = None
+        self.is_connected = False
+        self._client = None
+        self._conversation_turns: list[str] = []
+        self._receive_task: asyncio.Task | None = None
+        self._session_context = None
+        self._audio_send_count = 0
+        self._audio_recv_count = 0
+        self._greeting_done = False
+        # Manual VAD state
+        self._is_speaking = False
+        self._silence_start: float | None = None
+        self._speech_start_count = 0  # consecutive loud chunks counter
+
+    async def connect(self):
+        """Establish connection to Gemini Live API with manual VAD."""
+        try:
+            self._client = genai.Client(api_key=settings.gemini_api_key)
+
+            config = types.LiveConnectConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name="Aoede"
+                        )
+                    )
+                ),
+                system_instruction=types.Content(
+                    parts=[types.Part(text=self.system_prompt)]
+                ),
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        disabled=True
+                    )
+                ),
+                tools=[_SAVE_LEAD_TOOL],
+            )
+
+            self._session_context = self._client.aio.live.connect(
+                model="gemini-2.5-flash-native-audio-latest",
+                config=config,
+            )
+            self.session = await self._session_context.__aenter__()
+            self.is_connected = True
+
+            # Start receiving responses in background
+            self._receive_task = asyncio.create_task(self._receive_loop())
+
+            # Send initial prompt to trigger greeting
+            await self.session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[types.Part(text="A caller has just connected. Greet them now.")]
+                ),
+                turn_complete=True,
+            )
+
+            logger.info("Gemini Live API connected (manual VAD), greeting triggered")
+
+        except Exception as e:
+            logger.error(f"Failed to connect to Gemini: {e}", exc_info=True)
+            self.is_connected = False
+            raise
+
+    async def send_audio(self, pcm_audio: bytes):
+        """Send audio chunk to Gemini with manual voice activity detection.
+
+        Args:
+            pcm_audio: PCM audio bytes at 16000 Hz, 16-bit mono.
+        """
+        if not self.is_connected or not self.session:
+            return
+
+        if not self._greeting_done:
+            return
+
+        rms = _rms_energy(pcm_audio)
+
+        try:
+            if not self._is_speaking:
+                if rms > _SPEECH_START_RMS:
+                    self._speech_start_count += 1
+                    if self._speech_start_count >= _SPEECH_START_CHUNKS:
+                        # Sustained speech confirmed — signal activity start
+                        self._is_speaking = True
+                        self._silence_start = None
+                        self._speech_start_count = 0
+                        await self.session.send_realtime_input(
+                            activity_start=types.ActivityStart()
+                        )
+                        logger.info(f"Speech started (RMS={rms:.0f}, after {_SPEECH_START_CHUNKS} chunks)")
+                    # Still accumulating — don't send audio yet
+                    return
+                else:
+                    # Not loud enough — reset counter
+                    self._speech_start_count = 0
+                    return
+
+            # We're in speaking mode — send audio
+            await self.session.send_realtime_input(
+                media=types.Blob(data=pcm_audio, mime_type="audio/pcm;rate=16000")
+            )
+            self._audio_send_count += 1
+
+            # Check if speech ended
+            if rms < _SPEECH_END_RMS:
+                import time
+                now = time.monotonic()
+                if self._silence_start is None:
+                    self._silence_start = now
+                elif now - self._silence_start >= _SILENCE_DURATION:
+                    # Enough silence — end activity
+                    self._is_speaking = False
+                    self._silence_start = None
+                    await self.session.send_realtime_input(
+                        activity_end=types.ActivityEnd()
+                    )
+                    logger.info(
+                        f"Speech ended after {self._audio_send_count} chunks "
+                        f"(RMS={rms:.0f})"
+                    )
+            else:
+                self._silence_start = None
+
+            if self._audio_send_count % 50 == 1:
+                logger.info(
+                    f"Sending audio #{self._audio_send_count} "
+                    f"(RMS={rms:.0f}, speaking={self._is_speaking})"
+                )
+
+        except Exception as e:
+            logger.error(f"Error sending audio to Gemini: {e}", exc_info=True)
+
+    async def _receive_loop(self):
+        """Continuously receive audio responses from Gemini.
+
+        Wraps session.receive() in a while loop because the async generator
+        may exit after each turn_complete, requiring a fresh call.
+        """
+        if not self.session:
+            return
+
+        try:
+            while self.is_connected:
+                logger.info("Starting receive iteration...")
+                async for response in self.session.receive():
+                    if not self.is_connected:
+                        break
+
+                    # Handle tool calls (real-time lead capture)
+                    tool_call = getattr(response, "tool_call", None)
+                    if tool_call:
+                        await self._handle_tool_call(tool_call)
+                        continue
+
+                    server_content = getattr(response, "server_content", None)
+                    if not server_content:
+                        continue
+
+                    model_turn = getattr(server_content, "model_turn", None)
+                    turn_complete = getattr(server_content, "turn_complete", False)
+                    interrupted = getattr(server_content, "interrupted", False)
+
+                    if model_turn and model_turn.parts:
+                        for part in model_turn.parts:
+                            inline_data = getattr(part, "inline_data", None)
+                            if inline_data and inline_data.data:
+                                self._audio_recv_count += 1
+                                if self._audio_recv_count % 50 == 1:
+                                    logger.info(f"Gemini audio response chunk #{self._audio_recv_count}")
+                                if self.on_audio_response:
+                                    await self.on_audio_response(inline_data.data)
+
+                            text = getattr(part, "text", None)
+                            if text:
+                                self._conversation_turns.append(f"Agent: {text}")
+
+                    if turn_complete:
+                        if not self._greeting_done:
+                            self._greeting_done = True
+                            logger.info(
+                                f"Greeting complete ({self._audio_recv_count} audio chunks). "
+                                f"Now accepting caller audio."
+                            )
+                        else:
+                            logger.info(
+                                f"Gemini turn complete "
+                                f"(recv {self._audio_recv_count} audio chunks so far)"
+                            )
+
+                    if interrupted:
+                        logger.info("Gemini response interrupted by caller")
+
+                logger.info("session.receive() iterator ended, restarting...")
+
+        except asyncio.CancelledError:
+            logger.info("Gemini receive loop cancelled")
+        except Exception as e:
+            logger.error(f"Error in Gemini receive loop: {e}", exc_info=True)
+
+    async def _handle_tool_call(self, tool_call):
+        """Handle function calls from Gemini (e.g., save_lead)."""
+        for fc in tool_call.function_calls:
+            if fc.name == "save_lead":
+                args = fc.args or {}
+                logger.info(f"Gemini called save_lead: {args}")
+                self._save_lead_to_db(
+                    caller_name=args.get("caller_name"),
+                    contact_number=args.get("contact_number"),
+                    inquiry=args.get("inquiry"),
+                )
+                # Send tool response back to Gemini so it continues
+                await self.session.send_tool_response(
+                    function_responses=types.FunctionResponse(
+                        name="save_lead",
+                        response={"status": "saved"},
+                        id=fc.id,
+                    )
+                )
+            else:
+                logger.warning(f"Unknown tool call: {fc.name}")
+
+    def _save_lead_to_db(
+        self,
+        caller_name: str | None = None,
+        contact_number: str | None = None,
+        inquiry: str | None = None,
+    ):
+        """Save lead info to the CallLog record for this call."""
+        from sqlmodel import select
+
+        try:
+            with Session(get_engine()) as session:
+                call_log = session.exec(
+                    select(CallLog).where(CallLog.twilio_call_sid == self.call_sid)
+                ).first()
+                if not call_log:
+                    logger.warning(f"No call log found for SID: {self.call_sid}")
+                    return
+
+                if caller_name:
+                    call_log.caller_name = caller_name
+                if contact_number:
+                    # Store in caller_number if it's different from the Twilio number
+                    # (caller might give a different callback number)
+                    call_log.caller_inquiry = (
+                        f"{call_log.caller_inquiry or ''}\n"
+                        f"Contact: {contact_number}"
+                    ).strip()
+                if inquiry:
+                    existing = call_log.caller_inquiry or ""
+                    if inquiry not in existing:
+                        call_log.caller_inquiry = (
+                            f"{existing}\n{inquiry}" if existing else inquiry
+                        ).strip()
+
+                session.add(call_log)
+                session.commit()
+                logger.info(
+                    f"Lead saved for call {self.call_sid}: "
+                    f"name={caller_name}, contact={contact_number}, inquiry={inquiry}"
+                )
+        except Exception as e:
+            logger.error(f"Error saving lead to DB: {e}", exc_info=True)
+
+    async def generate_summary(self) -> str | None:
+        """Generate a conversation summary using Gemini text API."""
+        if not self._client:
+            return None
+
+        if not self._conversation_turns:
+            return "No conversation recorded."
+
+        conversation_text = "\n".join(self._conversation_turns)
+        summary_prompt = f"""Summarize this phone conversation in a structured format:
+
+{conversation_text}
+
+Provide the summary in this exact format:
+Name: [caller's name if mentioned, otherwise "Unknown"]
+Inquiry: [what they were asking about in one sentence]
+Summary: [2-3 sentence summary of the conversation]
+Interested In: [which package or service they showed interest in, if any]
+Follow Up: [yes/no — should the business owner call them back?]"""
+
+        try:
+            response = await self._client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=summary_prompt,
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"Error generating summary: {e}")
+            return f"Summary generation failed. Conversation had {len(self._conversation_turns)} turns."
+
+    async def disconnect(self):
+        """Close the Gemini Live API connection."""
+        self.is_connected = False
+
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._session_context:
+            try:
+                await self._session_context.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning(f"Error closing Gemini session: {e}")
+            self._session_context = None
+            self.session = None
+
+        logger.info(
+            f"Gemini agent disconnected "
+            f"(sent: {self._audio_send_count}, recv: {self._audio_recv_count})"
+        )
