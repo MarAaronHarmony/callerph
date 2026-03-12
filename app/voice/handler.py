@@ -165,33 +165,31 @@ async def media_stream(websocket: WebSocket, call_sid: str):
                     if client:
                         prompt = _load_prompt_safe(client.prompt_file)
                         if prompt:
-                            gemini_agent = GeminiVoiceAgent(
-                                system_prompt=prompt,
-                                call_sid=call_sid,
-                                on_audio_response=_queue_audio,
-                            )
-                            await gemini_agent.connect()
-                            logger.info(
-                                f"Gemini agent started for call {call_sid} "
-                                f"(client: {client.name})"
-                            )
+                            try:
+                                gemini_agent = GeminiVoiceAgent(
+                                    system_prompt=prompt,
+                                    call_sid=call_sid,
+                                    on_audio_response=_queue_audio,
+                                )
+                                await gemini_agent.connect()
+                                logger.info(
+                                    f"Gemini agent started for call {call_sid} "
+                                    f"(client: {client.name})"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to start Gemini for {call_sid}: {e}"
+                                )
+                                gemini_agent = None
+                                # Send fallback audio message via Twilio
+                                await _send_fallback_message(
+                                    websocket, stream_sid
+                                )
 
             elif event_type == "media":
                 if gemini_agent and gemini_agent.is_connected:
                     media_data = data["media"]
                     payload = media_data["payload"]
-                    # Log raw payload stats periodically
-                    chunk_num = media_data.get("chunk", "?")
-                    if str(chunk_num) in ("1", "50", "100", "200", "500"):
-                        import base64
-                        raw = base64.b64decode(payload)
-                        logger.info(
-                            f"Twilio media chunk #{chunk_num}: "
-                            f"track={media_data.get('track')}, "
-                            f"raw_len={len(raw)}, "
-                            f"first_bytes={raw[:8].hex()}, "
-                            f"payload_preview={payload[:20]}"
-                        )
                     pcm_audio = twilio_to_gemini(payload)
                     await gemini_agent.send_audio(pcm_audio)
 
@@ -219,6 +217,29 @@ async def media_stream(websocket: WebSocket, call_sid: str):
         except asyncio.CancelledError:
             pass
 
+
+
+async def _send_fallback_message(websocket: WebSocket, stream_sid: str | None):
+    """Send a TTS fallback message when Gemini is unavailable.
+
+    Uses Twilio's built-in TTS by closing the stream and using <Say>.
+    Since we're in a WebSocket stream, we can't use TwiML directly.
+    Instead, we log the failure — the call will end gracefully.
+    """
+    logger.warning("Sending fallback: Gemini unavailable, call will end")
+    # We can't inject TwiML into an active stream, so just close gracefully.
+    # The caller will hear silence briefly, then the call ends.
+    # For production: use Twilio's <Enqueue> or <Redirect> to a fallback TwiML.
+    if stream_sid:
+        try:
+            msg = {
+                "event": "mark",
+                "streamSid": stream_sid,
+                "mark": {"name": "fallback"},
+            }
+            await websocket.send_text(json.dumps(msg))
+        except Exception:
+            pass
 
 
 def _get_call_log(call_sid: str) -> CallLog | None:

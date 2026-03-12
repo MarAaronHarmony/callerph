@@ -1,8 +1,8 @@
-"""Gemini 2.5 Flash Live API voice agent with manual VAD."""
+"""Gemini 2.5 Flash Live API voice agent with robust VAD and auto-reconnect."""
 
 import asyncio
 import logging
-import struct
+import time
 from typing import Callable, Optional
 
 from google import genai
@@ -12,14 +12,17 @@ from sqlmodel import Session
 from app.config import settings
 from app.db.database import get_engine
 from app.models.call_log import CallLog
+from app.voice.vad import VoiceActivityDetector
 
 logger = logging.getLogger(__name__)
 
-# Speech detection thresholds
-_SPEECH_START_RMS = 400    # RMS above this = potential speech (raised to filter coughs)
-_SPEECH_END_RMS = 150      # RMS below this = speech may have ended
-_SILENCE_DURATION = 0.4    # seconds of silence before ending activity
-_SPEECH_START_CHUNKS = 3   # consecutive loud chunks needed to confirm speech (debounce)
+# Audio buffering — accumulate small chunks before sending to Gemini
+_BUFFER_DURATION_MS = 100  # send audio in 100ms batches
+_BUFFER_SIZE_BYTES = int(16000 * 2 * _BUFFER_DURATION_MS / 1000)  # 3200 bytes at 16kHz 16-bit
+
+# Auto-reconnect settings
+_MAX_RECONNECT_ATTEMPTS = 3
+_RECONNECT_DELAY_S = 1.0
 
 # Tool declaration for real-time lead capture
 _SAVE_LEAD_TOOL = {
@@ -55,16 +58,6 @@ _SAVE_LEAD_TOOL = {
 }
 
 
-def _rms_energy(pcm_audio: bytes) -> float:
-    """Calculate RMS energy of 16-bit PCM audio."""
-    if len(pcm_audio) < 2:
-        return 0.0
-    n_samples = len(pcm_audio) // 2
-    samples = struct.unpack(f"<{n_samples}h", pcm_audio[: n_samples * 2])
-    sum_sq = sum(s * s for s in samples)
-    return (sum_sq / n_samples) ** 0.5
-
-
 class GeminiVoiceAgent:
     """Manages a real-time voice conversation with Gemini Live API."""
 
@@ -86,35 +79,40 @@ class GeminiVoiceAgent:
         self._audio_send_count = 0
         self._audio_recv_count = 0
         self._greeting_done = False
-        # Manual VAD state
-        self._is_speaking = False
-        self._silence_start: float | None = None
-        self._speech_start_count = 0  # consecutive loud chunks counter
+        # VAD
+        self._vad = VoiceActivityDetector(sample_rate=16000, aggressiveness=2)
+        # Audio buffer
+        self._audio_buffer = bytearray()
+        # Reconnect state
+        self._reconnect_count = 0
+
+    def _build_config(self) -> types.LiveConnectConfig:
+        """Build the Gemini Live API connection config."""
+        return types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Aoede"
+                    )
+                )
+            ),
+            system_instruction=types.Content(
+                parts=[types.Part(text=self.system_prompt)]
+            ),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=True
+                )
+            ),
+            tools=[_SAVE_LEAD_TOOL],
+        )
 
     async def connect(self):
-        """Establish connection to Gemini Live API with manual VAD."""
+        """Establish connection to Gemini Live API."""
         try:
             self._client = genai.Client(api_key=settings.gemini_api_key)
-
-            config = types.LiveConnectConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name="Aoede"
-                        )
-                    )
-                ),
-                system_instruction=types.Content(
-                    parts=[types.Part(text=self.system_prompt)]
-                ),
-                realtime_input_config=types.RealtimeInputConfig(
-                    automatic_activity_detection=types.AutomaticActivityDetection(
-                        disabled=True
-                    )
-                ),
-                tools=[_SAVE_LEAD_TOOL],
-            )
+            config = self._build_config()
 
             self._session_context = self._client.aio.live.connect(
                 model="gemini-2.5-flash-native-audio-latest",
@@ -135,15 +133,78 @@ class GeminiVoiceAgent:
                 turn_complete=True,
             )
 
-            logger.info("Gemini Live API connected (manual VAD), greeting triggered")
+            logger.info("Gemini Live API connected, greeting triggered")
 
         except Exception as e:
             logger.error(f"Failed to connect to Gemini: {e}", exc_info=True)
             self.is_connected = False
             raise
 
+    async def _reconnect(self) -> bool:
+        """Attempt to reconnect to Gemini after a connection drop.
+
+        Returns True if reconnection succeeded.
+        """
+        if self._reconnect_count >= _MAX_RECONNECT_ATTEMPTS:
+            logger.error(
+                f"Max reconnect attempts ({_MAX_RECONNECT_ATTEMPTS}) reached, giving up"
+            )
+            return False
+
+        self._reconnect_count += 1
+        logger.warning(
+            f"Attempting reconnect {self._reconnect_count}/{_MAX_RECONNECT_ATTEMPTS}..."
+        )
+
+        # Clean up old session
+        if self._session_context:
+            try:
+                await self._session_context.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._session_context = None
+            self.session = None
+
+        await asyncio.sleep(_RECONNECT_DELAY_S)
+
+        try:
+            config = self._build_config()
+            self._session_context = self._client.aio.live.connect(
+                model="gemini-2.5-flash-native-audio-latest",
+                config=config,
+            )
+            self.session = await self._session_context.__aenter__()
+
+            # Re-send context so Gemini knows the conversation state
+            if self._conversation_turns:
+                context = "Conversation so far:\n" + "\n".join(self._conversation_turns[-5:])
+                await self.session.send_client_content(
+                    turns=types.Content(
+                        role="user",
+                        parts=[types.Part(text=context + "\nPlease continue the conversation.")]
+                    ),
+                    turn_complete=True,
+                )
+            else:
+                await self.session.send_client_content(
+                    turns=types.Content(
+                        role="user",
+                        parts=[types.Part(text="Continue the conversation.")]
+                    ),
+                    turn_complete=True,
+                )
+
+            self._greeting_done = True  # skip greeting on reconnect
+            self._vad.reset()
+            logger.info(f"Reconnected successfully (attempt {self._reconnect_count})")
+            return True
+
+        except Exception as e:
+            logger.error(f"Reconnect attempt {self._reconnect_count} failed: {e}")
+            return False
+
     async def send_audio(self, pcm_audio: bytes):
-        """Send audio chunk to Gemini with manual voice activity detection.
+        """Send audio chunk to Gemini with voice activity detection and buffering.
 
         Args:
             pcm_audio: PCM audio bytes at 16000 Hz, 16-bit mono.
@@ -154,62 +215,80 @@ class GeminiVoiceAgent:
         if not self._greeting_done:
             return
 
-        rms = _rms_energy(pcm_audio)
+        # VAD processing
+        event = self._vad.process_frame(pcm_audio)
 
         try:
-            if not self._is_speaking:
-                if rms > _SPEECH_START_RMS:
-                    self._speech_start_count += 1
-                    if self._speech_start_count >= _SPEECH_START_CHUNKS:
-                        # Sustained speech confirmed — signal activity start
-                        self._is_speaking = True
-                        self._silence_start = None
-                        self._speech_start_count = 0
-                        await self.session.send_realtime_input(
-                            activity_start=types.ActivityStart()
-                        )
-                        logger.info(f"Speech started (RMS={rms:.0f}, after {_SPEECH_START_CHUNKS} chunks)")
-                    # Still accumulating — don't send audio yet
-                    return
-                else:
-                    # Not loud enough — reset counter
-                    self._speech_start_count = 0
-                    return
-
-            # We're in speaking mode — send audio
-            await self.session.send_realtime_input(
-                media=types.Blob(data=pcm_audio, mime_type="audio/pcm;rate=16000")
-            )
-            self._audio_send_count += 1
-
-            # Check if speech ended
-            if rms < _SPEECH_END_RMS:
-                import time
-                now = time.monotonic()
-                if self._silence_start is None:
-                    self._silence_start = now
-                elif now - self._silence_start >= _SILENCE_DURATION:
-                    # Enough silence — end activity
-                    self._is_speaking = False
-                    self._silence_start = None
-                    await self.session.send_realtime_input(
-                        activity_end=types.ActivityEnd()
-                    )
-                    logger.info(
-                        f"Speech ended after {self._audio_send_count} chunks "
-                        f"(RMS={rms:.0f})"
-                    )
-            else:
-                self._silence_start = None
-
-            if self._audio_send_count % 50 == 1:
-                logger.info(
-                    f"Sending audio #{self._audio_send_count} "
-                    f"(RMS={rms:.0f}, speaking={self._is_speaking})"
+            if event == "speech_start":
+                # Flush any buffered audio and signal activity start
+                self._audio_buffer.clear()
+                await self.session.send_realtime_input(
+                    activity_start=types.ActivityStart()
                 )
+                # Send the current chunk immediately
+                self._audio_buffer.extend(pcm_audio)
+                await self._flush_buffer()
+                logger.info("VAD: Speech started")
+
+            elif event == "speech_continue":
+                # Buffer audio and send when buffer is full
+                self._audio_buffer.extend(pcm_audio)
+                if len(self._audio_buffer) >= _BUFFER_SIZE_BYTES:
+                    await self._flush_buffer()
+
+            elif event == "speech_end":
+                # Flush remaining audio and signal activity end
+                if self._audio_buffer:
+                    await self._flush_buffer()
+                await self.session.send_realtime_input(
+                    activity_end=types.ActivityEnd()
+                )
+                logger.info(
+                    f"VAD: Speech ended (sent {self._audio_send_count} chunks total)"
+                )
+
+            # "silence" — do nothing
 
         except Exception as e:
             logger.error(f"Error sending audio to Gemini: {e}", exc_info=True)
+            # Connection may have dropped — attempt reconnect
+            if "ConnectionClosed" in type(e).__name__ or "closed" in str(e).lower():
+                await self._handle_connection_drop()
+
+    async def _flush_buffer(self):
+        """Send buffered audio to Gemini and clear the buffer."""
+        if not self._audio_buffer:
+            return
+
+        data = bytes(self._audio_buffer)
+        self._audio_buffer.clear()
+
+        await self.session.send_realtime_input(
+            media=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
+        )
+        self._audio_send_count += 1
+
+        if self._audio_send_count % 100 == 1:
+            logger.info(f"Audio chunk #{self._audio_send_count} sent to Gemini")
+
+    async def _handle_connection_drop(self):
+        """Handle a dropped Gemini connection by attempting to reconnect."""
+        logger.warning("Gemini connection dropped, attempting reconnect...")
+
+        # Cancel existing receive loop
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+
+        success = await self._reconnect()
+        if success:
+            # Restart receive loop
+            self._receive_task = asyncio.create_task(self._receive_loop())
+        else:
+            self.is_connected = False
 
     async def _receive_loop(self):
         """Continuously receive audio responses from Gemini.
@@ -223,53 +302,70 @@ class GeminiVoiceAgent:
         try:
             while self.is_connected:
                 logger.info("Starting receive iteration...")
-                async for response in self.session.receive():
-                    if not self.is_connected:
-                        break
+                try:
+                    async for response in self.session.receive():
+                        if not self.is_connected:
+                            break
 
-                    # Handle tool calls (real-time lead capture)
-                    tool_call = getattr(response, "tool_call", None)
-                    if tool_call:
-                        await self._handle_tool_call(tool_call)
-                        continue
+                        # Handle tool calls (real-time lead capture)
+                        tool_call = getattr(response, "tool_call", None)
+                        if tool_call:
+                            await self._handle_tool_call(tool_call)
+                            continue
 
-                    server_content = getattr(response, "server_content", None)
-                    if not server_content:
-                        continue
+                        server_content = getattr(response, "server_content", None)
+                        if not server_content:
+                            continue
 
-                    model_turn = getattr(server_content, "model_turn", None)
-                    turn_complete = getattr(server_content, "turn_complete", False)
-                    interrupted = getattr(server_content, "interrupted", False)
+                        model_turn = getattr(server_content, "model_turn", None)
+                        turn_complete = getattr(server_content, "turn_complete", False)
+                        interrupted = getattr(server_content, "interrupted", False)
 
-                    if model_turn and model_turn.parts:
-                        for part in model_turn.parts:
-                            inline_data = getattr(part, "inline_data", None)
-                            if inline_data and inline_data.data:
-                                self._audio_recv_count += 1
-                                if self._audio_recv_count % 50 == 1:
-                                    logger.info(f"Gemini audio response chunk #{self._audio_recv_count}")
-                                if self.on_audio_response:
-                                    await self.on_audio_response(inline_data.data)
+                        if model_turn and model_turn.parts:
+                            for part in model_turn.parts:
+                                inline_data = getattr(part, "inline_data", None)
+                                if inline_data and inline_data.data:
+                                    self._audio_recv_count += 1
+                                    if self._audio_recv_count % 100 == 1:
+                                        logger.info(
+                                            f"Gemini audio chunk #{self._audio_recv_count}"
+                                        )
+                                    if self.on_audio_response:
+                                        await self.on_audio_response(inline_data.data)
 
-                            text = getattr(part, "text", None)
-                            if text:
-                                self._conversation_turns.append(f"Agent: {text}")
+                                text = getattr(part, "text", None)
+                                if text:
+                                    self._conversation_turns.append(f"Agent: {text}")
 
-                    if turn_complete:
-                        if not self._greeting_done:
-                            self._greeting_done = True
-                            logger.info(
-                                f"Greeting complete ({self._audio_recv_count} audio chunks). "
-                                f"Now accepting caller audio."
-                            )
-                        else:
-                            logger.info(
-                                f"Gemini turn complete "
-                                f"(recv {self._audio_recv_count} audio chunks so far)"
-                            )
+                        if turn_complete:
+                            if not self._greeting_done:
+                                self._greeting_done = True
+                                logger.info(
+                                    f"Greeting complete "
+                                    f"({self._audio_recv_count} audio chunks). "
+                                    f"Now accepting caller audio."
+                                )
+                            else:
+                                logger.info(
+                                    f"Turn complete "
+                                    f"(recv {self._audio_recv_count} chunks)"
+                                )
 
-                    if interrupted:
-                        logger.info("Gemini response interrupted by caller")
+                        if interrupted:
+                            logger.info("Gemini response interrupted by caller")
+
+                except Exception as inner_e:
+                    err_str = str(inner_e).lower()
+                    if "closed" in err_str or "keepalive" in err_str:
+                        logger.warning(f"Gemini connection lost in receive: {inner_e}")
+                        if self.is_connected:
+                            success = await self._reconnect()
+                            if success:
+                                continue  # restart the while loop with new session
+                            else:
+                                break
+                    else:
+                        raise
 
                 logger.info("session.receive() iterator ended, restarting...")
 
@@ -321,8 +417,6 @@ class GeminiVoiceAgent:
                 if caller_name:
                     call_log.caller_name = caller_name
                 if contact_number:
-                    # Store in caller_number if it's different from the Twilio number
-                    # (caller might give a different callback number)
                     call_log.caller_inquiry = (
                         f"{call_log.caller_inquiry or ''}\n"
                         f"Contact: {contact_number}"
@@ -371,7 +465,10 @@ Follow Up: [yes/no — should the business owner call them back?]"""
             return response.text
         except Exception as e:
             logger.error(f"Error generating summary: {e}")
-            return f"Summary generation failed. Conversation had {len(self._conversation_turns)} turns."
+            return (
+                f"Summary generation failed. "
+                f"Conversation had {len(self._conversation_turns)} turns."
+            )
 
     async def disconnect(self):
         """Close the Gemini Live API connection."""
