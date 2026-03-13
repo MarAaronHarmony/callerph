@@ -12,7 +12,7 @@ from sqlmodel import Session
 from app.config import settings
 from app.db.database import get_engine
 from app.models.call_log import CallLog
-from app.voice.vad import VoiceActivityDetector
+from app.voice.vad import VoiceActivityDetector, rms_energy
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ class GeminiVoiceAgent:
         self._audio_recv_count = 0
         self._greeting_done = False
         # VAD
-        self._vad = VoiceActivityDetector(sample_rate=16000, aggressiveness=2)
+        self._vad = VoiceActivityDetector(sample_rate=16000)
         # Audio buffer
         self._audio_buffer = bytearray()
         # Reconnect state
@@ -221,9 +221,10 @@ class GeminiVoiceAgent:
         # Log VAD state periodically for diagnostics
         self._vad_frame_count = getattr(self, "_vad_frame_count", 0) + 1
         if self._vad_frame_count % 100 == 1:
+            rms = rms_energy(pcm_audio)
             logger.info(
-                f"VAD frame #{self._vad_frame_count}: event={event}, "
-                f"speaking={self._vad.is_speaking}"
+                f"VAD #{self._vad_frame_count}: event={event}, "
+                f"RMS={rms:.0f}, speaking={self._vad.is_speaking}"
             )
 
         try:
