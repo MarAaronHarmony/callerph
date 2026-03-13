@@ -85,6 +85,9 @@ class GeminiVoiceAgent:
         self._audio_buffer = bytearray()
         # Reconnect state
         self._reconnect_count = 0
+        # Echo suppression — suppress VAD while Gemini is outputting audio
+        self._gemini_is_speaking = False
+        self._gemini_last_audio_time: float = 0
 
     def _build_config(self) -> types.LiveConnectConfig:
         """Build the Gemini Live API connection config."""
@@ -215,6 +218,17 @@ class GeminiVoiceAgent:
         if not self._greeting_done:
             return
 
+        # Echo suppression: skip VAD while Gemini is speaking or during
+        # the cooldown window after it stops (lets echo decay in Twilio path)
+        _ECHO_COOLDOWN_S = 0.3
+        if self._gemini_is_speaking:
+            return
+        if (
+            self._gemini_last_audio_time > 0
+            and time.monotonic() - self._gemini_last_audio_time < _ECHO_COOLDOWN_S
+        ):
+            return
+
         # VAD processing
         event = self._vad.process_frame(pcm_audio)
 
@@ -335,6 +349,9 @@ class GeminiVoiceAgent:
                                 inline_data = getattr(part, "inline_data", None)
                                 if inline_data and inline_data.data:
                                     self._audio_recv_count += 1
+                                    # Echo suppression: mark Gemini as speaking
+                                    self._gemini_is_speaking = True
+                                    self._gemini_last_audio_time = time.monotonic()
                                     if self._audio_recv_count % 100 == 1:
                                         logger.info(
                                             f"Gemini audio chunk #{self._audio_recv_count}"
@@ -347,6 +364,9 @@ class GeminiVoiceAgent:
                                     self._conversation_turns.append(f"Agent: {text}")
 
                         if turn_complete:
+                            # Echo suppression: Gemini finished speaking
+                            self._gemini_is_speaking = False
+                            self._gemini_last_audio_time = time.monotonic()
                             if not self._greeting_done:
                                 self._greeting_done = True
                                 logger.info(
@@ -361,6 +381,7 @@ class GeminiVoiceAgent:
                                 )
 
                         if interrupted:
+                            self._gemini_is_speaking = False
                             logger.info("Gemini response interrupted by caller")
 
                 except Exception as inner_e:
